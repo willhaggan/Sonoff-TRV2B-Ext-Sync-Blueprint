@@ -1,0 +1,138 @@
+blueprint:
+  name: "Sonoff TRV2b Sensor Sync V2"
+  author: whag
+  description: >
+    Sync External temperature Sensor With TRV2B
+    - Multiple external sensors allowed and auto averaged
+    - Mode check to ensure external sensor is selected
+    - Drift allowance
+    - Drift Duration before sync
+    - Logging
+  domain: automation
+  input:
+    external_temp_sensors:
+      name: Temperature Sensors
+      selector:
+        entity:
+          domain: sensor
+          device_class: temperature
+          multiple: true
+    climate_entity:
+      name: TRV Climate Entity
+      selector:
+        entity:
+          domain: climate
+    mode_select_entity:
+      name: TRV Mode Select Entity
+      selector:
+        entity:
+          domain: select
+    temp_input_number:
+      name: External Temperature Input Entity
+      description: "The number entity for the TRV (e.g., number.trv_kitchen_external_temperature_input)."
+      selector:
+        entity:
+          domain: number
+    trigger_duration:
+      name: Temperature Stability Duration
+      description: "How long a temperature change must persist before triggering."
+      default: 60
+      selector:
+        number:
+          min: 0
+          max: 600
+          unit_of_measurement: "seconds"
+    deadband_threshold:
+      name: Temperature Drift Threshold
+      default: 0.3
+      selector:
+        number:
+          min: 0.1
+          max: 1.0
+          step: 0.1
+          unit_of_measurement: "°C"
+    enable_logbook:
+      name: Enable Sync Logbook
+      default: true
+      selector:
+        boolean: {}
+
+mode: restart
+
+trigger:
+  - platform: state
+    entity_id: !input external_temp_sensors
+    for: !input trigger_duration
+    id: "drift"
+  - platform: state
+    entity_id: !input climate_entity
+    attribute: current_temperature
+    for: !input trigger_duration
+    id: "drift"
+  - platform: state
+    entity_id: !input mode_select_entity
+    to: "internal"
+    id: "mode_fault"
+
+variables:
+  trv: !input climate_entity
+  mode_entity: !input mode_select_entity
+  temp_num_entity: !input temp_input_number
+  sensors: !input external_temp_sensors
+  threshold: !input deadband_threshold
+  log_enabled: !input enable_logbook
+  
+  # Account for 1 or null on initial values
+  avg_temp: >
+    {% set values = expand(sensors) 
+       | map(attribute='state') 
+       | reject('in', ['unavailable', 'unknown', 'null', 'None']) 
+       | map('float', 0) 
+       | list %}
+    {% set filtered = values | reject('eq', 1) | list %}
+    {{ (filtered | sum / filtered | count) | round(1) if filtered | count > 0 else none }}
+  
+  trv_temp: "{{ state_attr(trv, 'current_temperature') | float(0) }}"
+  is_mode_fault: "{{ states(mode_entity) != 'external' }}"
+  drift_detected: "{{ (avg_temp - trv_temp) | abs >= threshold | float }}"
+
+action:
+  - condition: template
+    value_template: "{{ avg_temp is not none and (is_mode_fault or drift_detected) }}"
+
+  # --- STEP 1: MODE FIX ---
+  - if:
+      - condition: template
+        value_template: "{{ states(mode_entity) != 'external' }}"
+    then:
+      - service: select.select_option
+        target:
+          entity_id: !input mode_select_entity
+        data:
+          option: "external"
+      
+      - wait_for_trigger:
+          - platform: state
+            entity_id: !input mode_select_entity
+            to: "external"
+        timeout: "00:00:10"
+        continue_on_timeout: true
+      
+      - delay: 2
+
+  # --- STEP 2: DATA SYNC ---
+  - service: number.set_value
+    target:
+      entity_id: !input temp_input_number
+    data:
+      value: "{{ avg_temp }}"
+
+  # --- STEP 3: OPTIONAL LOGGING ---
+  - if:
+      - condition: template
+        value_template: "{{ log_enabled }}"
+    then:
+      - service: logbook.log
+        data:
+          name: "TRV Sync"
+          message: "Updated {{ temp_num_entity }}. Sent: {{ avg_temp }}°C, TRV was: {{ trv_temp }}°C."
