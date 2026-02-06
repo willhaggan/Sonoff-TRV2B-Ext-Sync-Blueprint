@@ -1,5 +1,5 @@
 blueprint:
-  name: "Sonoff TRV2b Sensor Sync V2"
+  name: "Sonoff TRVZB Sensor Sync V2"
   author: whag
   description: >
     Sync External temperature Sensor With TRV2B
