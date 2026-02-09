@@ -1,5 +1,5 @@
 blueprint:
-  name: "Sonoff TRVZB Sensor Sync V2"
+  name: "Sonoff TRVZb Sensor Sync V3"
   author: whag
   description: >
     Sync External temperature Sensor With TRV2B
@@ -40,7 +40,7 @@ blueprint:
       selector:
         number:
           min: 0
-          max: 600
+          max: 3600
           unit_of_measurement: "seconds"
     deadband_threshold:
       name: Temperature Drift Threshold
