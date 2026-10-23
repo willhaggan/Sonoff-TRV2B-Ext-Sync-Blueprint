@@ -1,0 +1,1 @@
+[![Import blueprint into Home Assistant](https://my.home-assistant.io/badges/blueprint_import.svg)](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https%3A%2F%2Fgithub.com%2Fwillhaggan%2FSonoff-TRV2B-Ext-Sync-Blueprint%2Fblob%2Fmain%2FTRV2B_External_Sync)
