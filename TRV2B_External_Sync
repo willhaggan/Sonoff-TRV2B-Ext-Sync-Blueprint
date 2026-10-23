@@ -1,17 +1,38 @@
+# To retain existing automation references, replace your existing V3 blueprint
+# file's contents without changing that file's name. Alternatively save as
+# /config/blueprints/automation/whag/sonoff_trvzb_sensor_sync_v4.yaml, create a
+# new automation from it, and disable the corresponding V3 automation.
+# After editing, reload automations and run the automation's actions once.
+# This blueprint changes the temperature SOURCE and external input only.
+# Existing schedules, target temperatures and heating mode are not changed.
+
 blueprint:
-  name: "Sonoff TRVZb Sensor Sync V3"
+  name: "Sonoff TRVZB Sensor Sync V4"
   author: whag
-  description: >
-    Sync External temperature Sensor With TRV2B
-    - Multiple external sensors allowed and auto averaged
-    - Mode check to ensure external sensor is selected
-    - Drift allowance
-    - Drift Duration before sync
-    - Logging
+  description: >-
+    Average one or more external temperature sensors and send the result to a
+    SONOFF TRVZB through its Zigbee2MQTT entities. Supports both the newer
+    remote_temperature/local_temperature options and legacy external/internal
+    options. Normal updates require a sustained difference from the last
+    external input; a fixed refresh at :00, :15, :30 and :45 bypasses this
+    deadband. Startup, entity recovery and sensor fallback also request a sync.
+    Invalid, non-finite, unsupported-unit and out-of-range readings are excluded.
+    If every external reading is invalid, writes stop and the optional internal
+    fallback is used. All original V3 input identifiers are retained.
+    Requires Home Assistant 2024.4 or later for sensor last_reported timestamps.
+    Device-reported state is useful feedback but is not independent proof of
+    a fresh radio acknowledgement, because MQTT entities may be optimistic.
   domain: automation
+  homeassistant:
+    min_version: "2024.4.0"
   input:
     external_temp_sensors:
       name: Temperature Sensors
+      description: >-
+        Select one or more room temperature sensors. Valid readings are equally
+        averaged. °C, °F and K are converted to Celsius before averaging.
+        Configure source availability/reporting so a disconnected thermometer
+        does not remain indefinitely available with an old numeric value.
       selector:
         entity:
           domain: sensor
@@ -19,31 +40,43 @@ blueprint:
           multiple: true
     climate_entity:
       name: TRV Climate Entity
+      description: Used for availability recovery and logbook diagnostics.
       selector:
         entity:
           domain: climate
     mode_select_entity:
       name: TRV Mode Select Entity
+      description: Select the TRV temperature_sensor_select entity.
       selector:
         entity:
           domain: select
     temp_input_number:
       name: External Temperature Input Entity
-      description: "The number entity for the TRV (e.g., number.trv_kitchen_external_temperature_input)."
+      description: >-
+        Select the TRV external_temperature_input number entity. Its unit must
+        be °C or °F; its advertised minimum and maximum are checked before writing.
       selector:
         entity:
           domain: number
     trigger_duration:
-      name: Temperature Stability Duration
-      description: "How long a temperature change must persist before triggering."
+      name: Sustained Temperature Drift Duration
+      description: >-
+        The difference from the last external temperature input must remain at
+        or above the threshold for this long. The readings may keep changing.
+        Startup, recovery and the 15-minute refresh bypass this duration.
       default: 60
       selector:
         number:
           min: 0
           max: 3600
-          unit_of_measurement: "seconds"
+          step: 1
+          unit_of_measurement: seconds
+          mode: box
     deadband_threshold:
       name: Temperature Drift Threshold
+      description: >-
+        Difference between the valid sensor average and the TRV external input,
+        measured in Celsius. Climate current_temperature is diagnostic only.
       default: 0.3
       selector:
         number:
@@ -56,83 +89,379 @@ blueprint:
       default: true
       selector:
         boolean: {}
+    max_sensor_age:
+      name: Maximum Sensor Report Age
+      description: >-
+        Exclude a sensor if Home Assistant has not received an entity report
+        within this many minutes. Uses last_reported, not last_changed, so an
+        unchanged reading can remain valid. Set above the normal reporting
+        interval. 0 disables the age check. Republished cached values can refresh
+        this timestamp, so source availability must also be configured correctly.
+      default: 120
+      selector:
+        number:
+          min: 0
+          max: 1440
+          step: 1
+          unit_of_measurement: minutes
+          mode: box
+    fallback_to_internal:
+      name: Use Internal Sensor When All External Readings Are Invalid
+      description: >-
+        When enabled, select the built-in sensor if no external reading is
+        usable. Loss is checked after 30 seconds and on periodic/startup runs.
+        External sensing resumes when usable readings return. When disabled,
+        writes stop and the TRV's own timeout behaviour is left to operate.
+      default: true
+      selector:
+        boolean: {}
 
-mode: restart
+# Queue recovery events rather than cancelling an in-progress write or wait.
+# Action snapshots below are evaluated when a queued run actually executes.
+mode: queued
+max: 5
+max_exceeded: silent
 
-trigger:
-  - platform: state
-    entity_id: !input external_temp_sensors
-    for: !input trigger_duration
-    id: "drift"
-  - platform: state
-    entity_id: !input climate_entity
-    attribute: current_temperature
-    for: !input trigger_duration
-    id: "drift"
-  - platform: state
-    entity_id: !input mode_select_entity
-    to: "internal"
-    id: "mode_fault"
-
-variables:
+# Only input constants go here. Live state calculations belong in the template
+# triggers themselves and in action-level variables, so they cannot freeze.
+trigger_variables:
+  sensors: !input external_temp_sensors
   trv: !input climate_entity
   mode_entity: !input mode_select_entity
   temp_num_entity: !input temp_input_number
-  sensors: !input external_temp_sensors
   threshold: !input deadband_threshold
   log_enabled: !input enable_logbook
-  
-  # Account for 1 or null on initial values
-  avg_temp: >
-    {% set values = expand(sensors) 
-       | map(attribute='state') 
-       | reject('in', ['unavailable', 'unknown', 'null', 'None']) 
-       | map('float', 0) 
-       | list %}
-    {% set filtered = values | reject('eq', 1) | list %}
-    {{ (filtered | sum / filtered | count) | round(1) if filtered | count > 0 else none }}
-  
-  trv_temp: "{{ state_attr(trv, 'current_temperature') | float(0) }}"
-  is_mode_fault: "{{ states(mode_entity) != 'external' }}"
-  drift_detected: "{{ (avg_temp - trv_temp) | abs >= threshold | float }}"
+  max_sensor_age: !input max_sensor_age
+  use_internal_fallback: !input fallback_to_internal
+
+trigger:
+  - platform: template
+    id: drift
+    value_template: >-
+      {% set ns = namespace(temperatures=[]) %}
+      {% for sensor in expand(sensors) %}
+        {% set unit = sensor.attributes.get('unit_of_measurement', '') %}
+        {% set reported = sensor.last_reported | default(sensor.last_updated, true) %}
+        {% set fresh = (max_sensor_age | float(0)) <= 0
+            or (as_timestamp(now()) - as_timestamp(reported, 0))
+               <= (max_sensor_age | float(0)) * 60 %}
+        {% if is_number(sensor.state) and fresh and unit in ['°C', '°F', 'K'] %}
+          {% set raw = sensor.state | float %}
+          {% set celsius = (raw - 32) * 5 / 9 if unit == '°F'
+              else raw - 273.15 if unit == 'K' else raw %}
+          {% if 0 <= celsius <= 99.9 %}
+            {% set ns.temperatures = ns.temperatures + [celsius] %}
+          {% endif %}
+        {% endif %}
+      {% endfor %}
+      {% set average = ((ns.temperatures | sum) / (ns.temperatures | count))
+          | round(1) if ns.temperatures | count > 0 else none %}
+      {% set number_unit = state_attr(temp_num_entity, 'unit_of_measurement') or '°C' %}
+      {% set previous_raw = states(temp_num_entity) %}
+      {% set previous = ((previous_raw | float) - 32) * 5 / 9
+          if is_number(previous_raw) and number_unit == '°F'
+          else (previous_raw | float) if is_number(previous_raw) and number_unit == '°C'
+          else none %}
+      {% set write_value = ((average * 9 / 5 + 32) if number_unit == '°F'
+          else average) | round(1) if average is not none else none %}
+      {% set options = state_attr(mode_entity, 'options') or [] %}
+      {% set remote_states = ['remote_temperature'] if 'remote_temperature' in options
+          else ['external', 'external_3'] %}
+      {{ average is not none and (
+          states(mode_entity) not in remote_states or previous is none
+          or (((average - previous) | abs) | round(3)) >= (threshold | float)) }}
+    for:
+      seconds: !input trigger_duration
+
+  - platform: template
+    id: sensors_invalid
+    value_template: >-
+      {% set ns = namespace(temperatures=[]) %}
+      {% for sensor in expand(sensors) %}
+        {% set unit = sensor.attributes.get('unit_of_measurement', '') %}
+        {% set reported = sensor.last_reported | default(sensor.last_updated, true) %}
+        {% set fresh = (max_sensor_age | float(0)) <= 0
+            or (as_timestamp(now()) - as_timestamp(reported, 0))
+               <= (max_sensor_age | float(0)) * 60 %}
+        {% if is_number(sensor.state) and fresh and unit in ['°C', '°F', 'K'] %}
+          {% set raw = sensor.state | float %}
+          {% set celsius = (raw - 32) * 5 / 9 if unit == '°F'
+              else raw - 273.15 if unit == 'K' else raw %}
+          {% if 0 <= celsius <= 99.9 %}
+            {% set ns.temperatures = ns.temperatures + [celsius] %}
+          {% endif %}
+        {% endif %}
+      {% endfor %}
+      {% set average = ((ns.temperatures | sum) / (ns.temperatures | count))
+          | round(1) if ns.temperatures | count > 0 else none %}
+      {% set number_unit = state_attr(temp_num_entity, 'unit_of_measurement') or '°C' %}
+      {% set previous_raw = states(temp_num_entity) %}
+      {% set previous = ((previous_raw | float) - 32) * 5 / 9
+          if is_number(previous_raw) and number_unit == '°F'
+          else (previous_raw | float) if is_number(previous_raw) and number_unit == '°C'
+          else none %}
+      {% set write_value = ((average * 9 / 5 + 32) if number_unit == '°F'
+          else average) | round(1) if average is not none else none %}
+      {{ ns.temperatures | count == 0 }}
+    for:
+      seconds: 30
+
+  # Catch both current and legacy fallback states, not remote/healthy changes.
+  - platform: state
+    entity_id: !input mode_select_entity
+    to:
+      - local_temperature
+      - remote_source_offline
+      - internal
+      - external_2
+    id: mode_fault
+
+  - platform: state
+    entity_id:
+      - !input climate_entity
+      - !input mode_select_entity
+      - !input temp_input_number
+    from: unavailable
+    id: trv_recovered
+  - platform: state
+    entity_id:
+      - !input climate_entity
+      - !input mode_select_entity
+      - !input temp_input_number
+    from: unknown
+    id: trv_recovered
+  - platform: state
+    entity_id: !input external_temp_sensors
+    from: unavailable
+    id: sensor_recovered
+  - platform: state
+    entity_id: !input external_temp_sensors
+    from: unknown
+    id: sensor_recovered
+
+  - platform: homeassistant
+    event: start
+    id: startup
+  - platform: event
+    event_type: automation_reloaded
+    id: reload
+  - platform: time_pattern
+    minutes: "/15"
+    id: refresh
 
 action:
-  - condition: template
-    value_template: "{{ avg_temp is not none and (is_mode_fault or drift_detected) }}"
-
-  # --- STEP 1: MODE FIX ---
   - if:
       - condition: template
-        value_template: "{{ states(mode_entity) != 'external' }}"
+        value_template: >-
+          {{ trigger is defined and trigger is not none
+             and (trigger.id | default('')) == 'startup' }}
+    then:
+      - delay:
+          seconds: 15
+
+  - variables:
+      reason: >-
+        {{ trigger.id | default('manual')
+           if trigger is defined and trigger is not none else 'manual' }}
+      options: "{{ state_attr(mode_entity, 'options') or [] }}"
+      external_option: >-
+        {{ 'remote_temperature' if 'remote_temperature' in options
+           else 'external' if 'external' in options else none }}
+      internal_option: >-
+        {{ 'local_temperature' if 'local_temperature' in options
+           else 'internal' if 'internal' in options else none }}
+      remote_states: >-
+        {{ ['remote_temperature'] if external_option == 'remote_temperature'
+           else ['external', 'external_3'] }}
+
+  # Reused after mode changes to avoid sending a snapshot taken before a wait.
+  - variables: &read_sample
+      sample: >-
+        {% set ns = namespace(temperatures=[]) %}
+        {% for sensor in expand(sensors) %}
+          {% set unit = sensor.attributes.get('unit_of_measurement', '') %}
+          {% set reported = sensor.last_reported | default(sensor.last_updated, true) %}
+          {% set fresh = (max_sensor_age | float(0)) <= 0
+              or (as_timestamp(now()) - as_timestamp(reported, 0))
+                 <= (max_sensor_age | float(0)) * 60 %}
+          {% if is_number(sensor.state) and fresh and unit in ['°C', '°F', 'K'] %}
+            {% set raw = sensor.state | float %}
+            {% set celsius = (raw - 32) * 5 / 9 if unit == '°F'
+                else raw - 273.15 if unit == 'K' else raw %}
+            {% if 0 <= celsius <= 99.9 %}
+              {% set ns.temperatures = ns.temperatures + [celsius] %}
+            {% endif %}
+          {% endif %}
+        {% endfor %}
+        {% set average = ((ns.temperatures | sum) / (ns.temperatures | count))
+            | round(1) if ns.temperatures | count > 0 else none %}
+        {% set number_unit = state_attr(temp_num_entity, 'unit_of_measurement') or '°C' %}
+        {% set previous_raw = states(temp_num_entity) %}
+        {% set previous = ((previous_raw | float) - 32) * 5 / 9
+            if is_number(previous_raw) and number_unit == '°F'
+            else (previous_raw | float) if is_number(previous_raw) and number_unit == '°C'
+            else none %}
+        {% set write_value = ((average * 9 / 5 + 32) if number_unit == '°F'
+            else average) | round(1) if average is not none else none %}
+        {{ dict(count=ns.temperatures | count, average_c=average,
+            previous_c=previous, write_value=write_value, unit=number_unit) }}
+
+  - if:
+      - condition: template
+        value_template: "{{ sample.count == 0 }}"
+    then: &no_external_data
+      - if:
+          - condition: template
+            value_template: >-
+              {{ use_internal_fallback and internal_option is not none
+                 and states(mode_entity) != 'unavailable'
+                 and not is_state(mode_entity, internal_option) }}
+        then:
+          - service: select.select_option
+            target:
+              entity_id: !input mode_select_entity
+            data:
+              option: "{{ internal_option }}"
+          - wait_template: "{{ is_state(mode_entity, internal_option) }}"
+            timeout:
+              seconds: 10
+            continue_on_timeout: true
+      - if:
+          - condition: template
+            value_template: "{{ log_enabled }}"
+        then:
+          - service: logbook.log
+            data:
+              name: TRV Sync
+              entity_id: !input climate_entity
+              message: >-
+                No usable external temperature; no temperature sent.
+                Internal fallback {{ 'enabled' if use_internal_fallback else 'disabled' }}.
+                Reported sensor mode: {{ states(mode_entity) }}.
+                Trigger: {{ reason }}.
+      - stop: No usable external temperature readings.
+
+  - if:
+      - condition: template
+        value_template: >-
+          {{ external_option is none or sample.unit not in ['°C', '°F'] }}
+    then:
+      - if:
+          - condition: template
+            value_template: "{{ log_enabled }}"
+        then:
+          - service: logbook.log
+            data:
+              name: TRV Sync
+              entity_id: !input climate_entity
+              message: >-
+                Sync skipped: unsupported select options {{ options }} or
+                external-input unit {{ sample.unit }}. Check the selected entities.
+      - stop: Unsupported TRV entities or options.
+
+  - condition: template
+    value_template: >-
+      {{ states(mode_entity) != 'unavailable'
+         and states(temp_num_entity) != 'unavailable' }}
+
+  # A queued drift run may no longer need to write. Refresh/recovery runs do.
+  - condition: template
+    value_template: >-
+      {{ reason != 'drift' or states(mode_entity) not in remote_states
+         or sample.previous_c is none
+         or (((sample.average_c - sample.previous_c) | abs) | round(3))
+            >= (threshold | float) }}
+
+  - condition: template
+    value_template: >-
+      {{ (state_attr(temp_num_entity, 'min') | float(-1000))
+         <= sample.write_value
+         <= (state_attr(temp_num_entity, 'max') | float(1000)) }}
+
+  # Send first: a fresh write can recover remote_source_offline automatically.
+  # A service failure stops this run and is visible in the automation trace.
+  - service: number.set_value
+    target:
+      entity_id: !input temp_input_number
+    data:
+      value: "{{ sample.write_value }}"
+
+  - if:
+      - condition: template
+        value_template: >-
+          {{ states(mode_entity) in ['remote_source_offline', 'external_2'] }}
+    then:
+      - wait_template: "{{ states(mode_entity) in remote_states }}"
+        timeout:
+          seconds: 3
+        continue_on_timeout: true
+
+  - if:
+      - condition: template
+        value_template: "{{ states(mode_entity) not in remote_states }}"
     then:
       - service: select.select_option
         target:
           entity_id: !input mode_select_entity
         data:
-          option: "external"
-      
-      - wait_for_trigger:
-          - platform: state
-            entity_id: !input mode_select_entity
-            to: "external"
-        timeout: "00:00:10"
+          option: "{{ external_option }}"
+      - wait_template: "{{ states(mode_entity) in remote_states }}"
+        timeout:
+          seconds: 10
         continue_on_timeout: true
-      
-      - delay: 2
+      - if:
+          - condition: template
+            value_template: "{{ not wait.completed }}"
+        then:
+          - if:
+              - condition: template
+                value_template: "{{ log_enabled }}"
+            then:
+              - service: logbook.log
+                data:
+                  name: TRV Sync
+                  entity_id: !input climate_entity
+                  message: >-
+                    External-temperature write requested, but external mode was
+                    not confirmed within 10 seconds. Reported mode:
+                    {{ states(mode_entity) }}. Check Zigbee2MQTT and the device.
+          - stop: External sensor mode was not confirmed.
 
-  # --- STEP 2: DATA SYNC ---
-  - service: number.set_value
-    target:
-      entity_id: !input temp_input_number
-    data:
-      value: "{{ avg_temp }}"
+      - variables: *read_sample
+      - if:
+          - condition: template
+            value_template: "{{ sample.count == 0 }}"
+        then: *no_external_data
+      - condition: template
+        value_template: >-
+          {{ states(temp_num_entity) != 'unavailable'
+             and states(mode_entity) in remote_states
+             and sample.unit in ['°C', '°F']
+             and (state_attr(temp_num_entity, 'min') | float(-1000))
+                 <= sample.write_value
+                 <= (state_attr(temp_num_entity, 'max') | float(1000)) }}
+      # Repeat only after forcing the mode, for devices that require selecting
+      # external sensing before accepting the external temperature input.
+      - service: number.set_value
+        target:
+          entity_id: !input temp_input_number
+        data:
+          value: "{{ sample.write_value }}"
 
-  # --- STEP 3: OPTIONAL LOGGING ---
   - if:
       - condition: template
         value_template: "{{ log_enabled }}"
     then:
       - service: logbook.log
         data:
-          name: "TRV Sync"
-          message: "Updated {{ temp_num_entity }}. Sent: {{ avg_temp }}°C, TRV was: {{ trv_temp }}°C."
+          name: TRV Sync
+          entity_id: !input climate_entity
+          message: >-
+            Requested {{ sample.write_value }}{{ sample.unit }}
+            (average {{ sample.average_c }}°C from {{ sample.count }} valid sensor(s)).
+            Reported sensor mode: {{ states(mode_entity) }}.
+            Climate current temperature:
+            {{ state_attr(trv, 'current_temperature') }}
+            {{ state_attr(trv, 'temperature_unit') or '' }}.
+            Trigger: {{ reason }}. This log records the service request and
+            reported mode, not an independent device acknowledgement.
